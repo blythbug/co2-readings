@@ -1,20 +1,9 @@
-import javax.swing.*;
 import java.awt.*;
-import java.io.BufferedWriter;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.List;
-import java.util.concurrent.locks.ReentrantLock;
+import java.io.*;
+import java.net.Socket;
+import javax.swing.*;
 
 public class FrameDisplayer extends JFrame {
-
-    //Dummy Data
-    String[] column = {"ID","Postcode","CO2(ppm)"};
-    String[][] data = {};
 
     // Panel Setup
     CardLayout cardLayout = new CardLayout();
@@ -24,7 +13,7 @@ public class FrameDisplayer extends JFrame {
 
     // Elements for loginPanel
     JLabel welcomeLabel = new JLabel("Welcome to the CO2 measurement Database!");
-    JLabel portLabel = new JLabel("Address: ");
+    JLabel portLabel = new JLabel("Port: ");
     JLabel loginLabel = new JLabel("ID: ");
     JTextField loginField = new JTextField(20);
     JTextField portField = new JTextField(20);
@@ -39,10 +28,14 @@ public class FrameDisplayer extends JFrame {
     JButton submitButton = new JButton("Submit");
     JButton backButton = new JButton("Back");
 
-    // Local Setup
-    private static final Path LOCAL_CSV = Paths.get(System.getProperty("user.dir"), "submissions_local.csv");
-    private final ReentrantLock fileLock = new ReentrantLock();
-    private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ofPattern("dd-MM-yy HH:mm:ss");
+    // Server Connection
+    private Socket serverSocket;
+    private BufferedReader serverIn;
+    private PrintWriter serverOut;
+    private static final String DEFAULT_HOST = "localhost";
+    private static final int DEFAULT_PORT = 5000;
+    private Thread serverReaderThread;
+    private volatile boolean readerRunning = false;
 
     FrameDisplayer() {
 
@@ -156,23 +149,38 @@ public class FrameDisplayer extends JFrame {
         // Button events
         confirmButton.addActionListener(e -> {
             String id = loginField.getText().trim();
-            String port = portField.getText().trim();
-            if (id.isEmpty() || port.isEmpty()) {
+            String address = portField.getText().trim();
+            if (id.isEmpty()) {
                 JOptionPane.showMessageDialog(this,
-                        "Please fill in both ID and Address fields.",
+                        "Please enter an ID.",
                         "Missing input",
                         JOptionPane.WARNING_MESSAGE);
-                if (id.isEmpty()) {
-                    loginField.requestFocusInWindow();
-                } else {
-                    portField.requestFocusInWindow();
-                }
+                loginField.requestFocusInWindow();
                 return;
             }
-            // load local CSV into text pane when moving to view
-            readLocalCsvToTextPane();
-            cardLayout.show(mainPanel, "viewPanel");
+            try {
+                String[] hp = parseAddress(address);
+                String host = hp[0];
+                int port = Integer.parseInt(hp[1]);
+                connectToServer(host, port);
+                textPane.setText("Connected to server at " + host + ":" + port + "\n\nReady to submit CO2 measurements.");
+                cardLayout.show(mainPanel, "viewPanel");
+            } catch (IOException ioEx) {
+                JOptionPane.showMessageDialog(this,
+                        "Failed to connect to server: " + ioEx.getMessage(),
+                        "Connection error",
+                        JOptionPane.ERROR_MESSAGE);
+                portField.requestFocusInWindow();
+            } catch (NumberFormatException nfe) {
+                JOptionPane.showMessageDialog(this,
+                        "Port must be a number.",
+                        "Invalid port",
+                        JOptionPane.WARNING_MESSAGE);
+                portField.requestFocusInWindow();
+            }
         });
+
+
 
         submitButton.addActionListener(e -> {
             String postcode = postcodeField.getText().trim();
@@ -207,29 +215,26 @@ public class FrameDisplayer extends JFrame {
                 return;
             }
 
-            // timestamp on submit (UK time) in format dd-MM-yy HH:mm:ss
-            String timestamp = ZonedDateTime.now(ZoneId.of("Europe/London")).format(TS_FMT);
             String userId = loginField.getText().trim();
-
             try {
-                appendToLocalCsv(userId, timestamp, postcode, String.valueOf(co2));
-                readLocalCsvToTextPane();
-                JOptionPane.showMessageDialog(this,
-                        "Saved locally with timestamp: " + timestamp,
-                        "Saved",
-                        JOptionPane.INFORMATION_MESSAGE);
+                sendToServer(userId, postcode, String.valueOf(co2));
                 // clear input fields
                 postcodeField.setText("");
                 co2Field.setText("");
             } catch (IOException ioEx) {
                 JOptionPane.showMessageDialog(this,
-                        "Failed to write local CSV: " + ioEx.getMessage(),
-                        "Write error",
+                        "Failed to send data to server: " + ioEx.getMessage(),
+                        "Send error",
                         JOptionPane.ERROR_MESSAGE);
             }
         });
 
         backButton.addActionListener(e -> {
+            try {
+                disconnectFromServer();
+            } catch (IOException ioEx) {
+                System.err.println("Error disconnecting: " + ioEx.getMessage());
+            }
             cardLayout.show(mainPanel, "loginPanel");
         });
 
@@ -246,58 +251,109 @@ public class FrameDisplayer extends JFrame {
 
     }
 
-    // CSV writer
-    private void appendToLocalCsv(String userId, String timestamp, String postcode, String co2) throws IOException {
-        fileLock.lock();
-        try {
-            boolean exists = Files.exists(LOCAL_CSV);
-            try (BufferedWriter bw = Files.newBufferedWriter(LOCAL_CSV, StandardCharsets.UTF_8,
-                    StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
-                if (!exists) {
-                    bw.write("User ID,Timestamp,Postcode,CO2(ppm)");
-                    bw.newLine();
+    // Server connection
+    private void connectToServer(String host, int port) throws IOException {
+        serverSocket = new Socket(host, port);
+        serverIn = new BufferedReader(new InputStreamReader(serverSocket.getInputStream()));
+        serverOut = new PrintWriter(serverSocket.getOutputStream(), true);
+
+        // start background reader to handle server messages (CONNECTED, DATA_START, SUCCESS, ERROR, SERVER_FULL)
+        readerRunning = true;
+        serverReaderThread = new Thread(() -> {
+            try {
+                String line;
+                while (readerRunning && (line = serverIn.readLine()) != null) {
+                    if ("SERVER_FULL".equals(line)) {
+                        SwingUtilities.invokeLater(() -> {
+                            JOptionPane.showMessageDialog(this,
+                                    "Server has reached maximum capacity (4 clients). Connection rejected.",
+                                    "Server Full",
+                                    JOptionPane.WARNING_MESSAGE);
+                            try {
+                                disconnectFromServer();
+                            } catch (IOException ignored) {
+                            }
+                            cardLayout.show(mainPanel, "loginPanel");
+                        });
+                        break;
+                    }
+                    if ("DATA_START".equals(line)) {
+                        StringBuilder sb = new StringBuilder();
+                        while ((line = serverIn.readLine()) != null && !"DATA_END".equals(line)) {
+                            sb.append(line).append(System.lineSeparator());
+                        }
+                        final String csvText = sb.toString();
+                        SwingUtilities.invokeLater(() -> textPane.setText(csvText));
+                    }
+                    if (line.startsWith("SUCCESS:")) {
+                        String ts = line.substring(8);
+                        SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                                "Data saved with timestamp: " + ts,
+                                "Success",
+                                JOptionPane.INFORMATION_MESSAGE));
+
+                    }
+                    if (line.startsWith("ERROR:")) {
+                        String err = line.substring(6);
+                        SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                                "Server error: " + err,
+                                "Server error",
+                                JOptionPane.ERROR_MESSAGE));
+
+                    }
+                    // ignore other lines (CONNECTED, etc.)
                 }
-                bw.write(escapeCsv(userId));
-                bw.write(",");
-                bw.write(escapeCsv(timestamp));
-                bw.write(",");
-                bw.write(escapeCsv(postcode));
-                bw.write(",");
-                bw.write(escapeCsv(co2));
-                bw.newLine();
-                bw.flush();
+            } catch (IOException e) {
+                if (readerRunning) System.err.println("Server reader error: " + e.getMessage());
             }
-        } finally {
-            fileLock.unlock();
+        });
+        serverReaderThread.setDaemon(true);
+        serverReaderThread.start();
+    }
+
+    // Send data to server
+    private void sendToServer(String userId, String postcode, String co2) throws IOException {
+        if (serverOut == null) {
+            throw new IOException("Not connected to server");
+        }
+
+        // Format: USER_ID|POSTCODE|CO2
+        String data = userId + "|" + postcode + "|" + co2;
+        serverOut.println(data);
+        // responses (SUCCESS/ERROR and DATA_START/DATA_END) are handled asynchronously
+    }
+
+    // (No synchronous CSV reader — client uses background reader thread.)
+
+    // Disconnect from server
+    private void disconnectFromServer() throws IOException {
+        readerRunning = false;
+        if (serverOut != null) {
+            serverOut.println("DISCONNECT");
+            serverOut.flush();
+        }
+        if (serverSocket != null) {
+            serverSocket.close();
+        }
+        if (serverReaderThread != null) {
+            serverReaderThread.interrupt();
+            serverReaderThread = null;
         }
     }
 
-    // CSV reader fill textPane
-    private void readLocalCsvToTextPane() {
+    // Parse address input supporting: "host", "host:port", or "port"
+    private String[] parseAddress(String address) {
+        if (address == null || address.isEmpty()) return new String[]{DEFAULT_HOST, String.valueOf(DEFAULT_PORT)};
+        if (address.contains(":")) {
+            String[] parts = address.split(":", 2);
+            String host = parts[0].isEmpty() ? DEFAULT_HOST : parts[0];
+            return new String[]{host, parts[1]};
+        }
         try {
-            if (!Files.exists(LOCAL_CSV)) {
-                textPane.setText("");
-                return;
-            }
-            List<String> lines = Files.readAllLines(LOCAL_CSV, StandardCharsets.UTF_8);
-            StringBuilder sb = new StringBuilder();
-            for (String l : lines) {
-                sb.append(l).append(System.lineSeparator());
-            }
-            textPane.setText(sb.toString());
-        } catch (IOException ex) {
-            textPane.setText("Error reading local CSV: " + ex.getMessage());
+            int p = Integer.parseInt(address);
+            return new String[]{DEFAULT_HOST, String.valueOf(p)};
+        } catch (NumberFormatException ex) {
+            return new String[]{address, String.valueOf(DEFAULT_PORT)};
         }
     }
-
-    // CSV formatting
-    private String escapeCsv(String s) {
-        if (s == null) return "";
-        String value = s.replace("\"", "\"\"");
-        if (value.contains(",") || value.contains("\"") || value.contains("\n") || value.contains("\r")) {
-            return "\"" + value + "\"";
-        }
-        return value;
-    }
-
 }
